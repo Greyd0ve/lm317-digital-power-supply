@@ -1,0 +1,25 @@
+# Keil build output
+**/Objects/
+**/Listings/
+
+**/*.o
+**/*.d
+**/*.crf
+**/*.axf
+**/*.hex
+**/*.bin
+**/*.map
+**/*.lst
+**/*.dep
+**/*.lnp
+**/*.htm
+
+# Keil user/debug files
+**/DebugConfig/
+**/*.uvguix.*
+
+# Optional
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
