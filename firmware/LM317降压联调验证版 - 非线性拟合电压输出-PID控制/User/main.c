@@ -37,7 +37,7 @@
 
 /* 保护阈值 */
 #define OCP_LIMIT_MA                1250U
-#define OVP_LIMIT_MV                12300U
+#define OVP_LIMIT_MV                14000U
 
 /* ADC通道定义 */
 #define ADC_CHANNEL_VOUT            ADC_Channel_0      /* PA0 */
@@ -46,6 +46,36 @@
 /* ADC采样平均次数 */
 #define VOLTAGE_AVG_COUNT           32U
 #define CURRENT_AVG_COUNT           16U
+
+/* 控制周期：主循环 Delay_ms(20) -> 20ms */
+#define CONTROL_PERIOD_S            0.02f
+
+/* PID参数
+   你测试认为这组比较合适：
+   P = 0.5
+   I = 10
+   D = 0
+ */
+#define PID_KP                      0.5f
+#define PID_KI                      10.0f
+#define PID_KD                      0.0f
+
+/* PID输出到 DAC 码值增量的映射系数
+   这里采用“增量式 PID”：
+   先根据误差计算本周期应增加/减少多少控制量，
+   再把这个控制量映射成 DAC 码值增量。
+
+   经验上取 32 比较接近你原来分段逼近的动作量级：
+   - 误差 1.0V 时，首个周期大约调整 22 个码值
+   - 误差 0.5V 时，首个周期大约调整 11 个码值
+ */
+#define PID_OUTPUT_TO_DAC_CODE      32.0f
+
+/* 每个控制周期允许的最大 DAC 变化量，防止瞬间跳太大 */
+#define PID_MAX_DELTA_CODE          40
+
+/* 目标接近时的静区，减小抖动 */
+#define PID_DEADBAND_MV             40
 
 /* 电压校准模型参数
    你拟合得到的是：
@@ -66,52 +96,43 @@
  * ============================================================
  */
 
-static uint32_t g_TargetVoltage_mV = 0;     /* 目标输出电压（设定值） */
+static uint32_t g_SetVoltage_mV = 0;        /* 待确认设定值 */
+static uint32_t g_TargetVoltage_mV = 0;     /* 已确认的目标输出电压 */
 static uint32_t g_OutputVoltage_mV = 0;     /* 实际输出电压（校准后） */
 static uint32_t g_OutputCurrent_mA = 0;     /* 实际输出电流 */
 static uint16_t g_DacCode = 0;              /* 当前 DAC 数码值 */
 static uint8_t  g_ProtectFlag = 0;          /* 保护标志 */
+static uint8_t  g_ProtectType = 0;          /* 0:无保护 1:OCP 2:OVP */
 static uint32_t g_StepVoltage_mV = STEP_SMALL_MV;
+
+/* PID历史误差（单位：V）
+   用于增量式 PID：
+   du = Kp*(e[k]-e[k-1]) + Ki*e[k]*T + Kd*(e[k]-2e[k-1]+e[k-2])/T
+ */
+static float g_PidErr_1 = 0.0f;
+static float g_PidErr_2 = 0.0f;
 
 /* ============================================================
  *                    电压校准函数
  * ============================================================
  */
 
-/* 把“程序原始换算得到的电压值”校准成“实际输出电压”
- *
- * 输入：
- *   Raw_mV -> 原始换算电压，单位 mV
- *
- * 输出：
- *   校准后的实际电压，单位 mV
- *
- * 注意：
- *   拟合关系 y = x^A 是以“伏特 V”为单位建立的，
- *   所以这里必须先把 mV 转成 V，再做幂运算，最后再转回 mV。
- */
 static uint32_t Voltage_Calibration(uint32_t Raw_mV)
 {
-	float y_V;            /* 原始电压值，单位 V */
-	float x_V;            /* 校准后的实际电压，单位 V */
-	uint32_t Real_mV;     /* 校准后的实际电压，单位 mV */
+	float y_V;
+	float x_V;
+	uint32_t Real_mV;
 
-	/* 防止 0 或非常小的数参与幂运算后出现不必要误差 */
 	if (Raw_mV == 0)
 	{
 		return 0;
 	}
 
-	/* mV -> V */
 	y_V = (float)Raw_mV / 1000.0f;
-
-	/* 根据 x = y^(1/A) 反推实际电压 */
 	x_V = powf(y_V, VOLT_FIT_INV_A);
-
-	/* V -> mV，并四舍五入 */
 	Real_mV = (uint32_t)(x_V * 1000.0f + 0.5f);
 
-	return Real_mV;
+	return Real_mV-100.0f;
 }
 
 /* ============================================================
@@ -119,37 +140,21 @@ static uint32_t Voltage_Calibration(uint32_t Raw_mV)
  * ============================================================
  */
 
-/* 读取输出电压，返回值单位 mV
- *
- * 流程：
- * 1. ADC采样得到 ADC_V 节点电压
- * 2. 根据分压比换算出“原始输出电压”
- * 3. 用拟合关系做校准
- * 4. 返回“校准后的实际输出电压”
- */
 static uint32_t Read_OutputVoltage_mV(void)
 {
-	uint16_t ADC_Value;      /* ADC 原始值 */
-	uint32_t ADC_mV;         /* ADC引脚上的实际电压，单位 mV */
-	uint32_t RawVout_mV;     /* 未校准前的输出电压，单位 mV */
-	uint32_t CalVout_mV;     /* 校准后的输出电压，单位 mV */
+	uint16_t ADC_Value;
+	uint32_t ADC_mV;
+	uint32_t RawVout_mV;
+	uint32_t CalVout_mV;
 
-	/* 对电压通道采样 32 次并求平均，降低抖动 */
 	ADC_Value = AD_GetAverage(ADC_CHANNEL_VOUT, VOLTAGE_AVG_COUNT);
-
-	/* ADC原始值 -> ADC引脚电压 */
 	ADC_mV = (uint32_t)ADC_Value * ADC_VREF_MV / 4095U;
-
-	/* 根据分压比反推原始输出电压 */
 	RawVout_mV = ADC_mV * VOLT_DIVIDER_NUM / VOLT_DIVIDER_DEN;
-
-	/* 用拟合关系做电压校准 */
 	CalVout_mV = Voltage_Calibration(RawVout_mV);
 
 	return CalVout_mV;
 }
 
-/* 读取输出电流，返回值单位 mA */
 static uint32_t Read_OutputCurrent_mA(void)
 {
 	uint16_t ADC_Value;
@@ -161,7 +166,6 @@ static uint32_t Read_OutputCurrent_mA(void)
 
 	Iout_mA = ADC_mV * 1000U / CURRENT_ADC_MV_PER_A;
 
-	/* 很小的电流直接认为是 0 */
 	if (Iout_mA < 10U)
 	{
 		Iout_mA = 0;
@@ -192,6 +196,17 @@ static void Output_Shutdown(void)
 }
 
 /* ============================================================
+ *                    PID辅助函数区
+ * ============================================================
+ */
+
+static void PID_Reset(void)
+{
+	g_PidErr_1 = 0.0f;
+	g_PidErr_2 = 0.0f;
+}
+
+/* ============================================================
  *                    保护逻辑函数区
  * ============================================================
  */
@@ -201,15 +216,21 @@ static void Protection_Check(void)
 	if (g_OutputCurrent_mA > OCP_LIMIT_MA)
 	{
 		g_ProtectFlag = 1;
+		g_ProtectType = 1;    /* OCP */
 		g_TargetVoltage_mV = 0;
+		PID_Reset();
 		Output_Shutdown();
+		return;
 	}
 
 	if (g_OutputVoltage_mV > OVP_LIMIT_MV)
 	{
 		g_ProtectFlag = 1;
+		g_ProtectType = 2;    /* OVP */
 		g_TargetVoltage_mV = 0;
+		PID_Reset();
 		Output_Shutdown();
+		return;
 	}
 }
 
@@ -218,17 +239,20 @@ static void Protection_Check(void)
  * ============================================================
  */
 
-/* 简单闭环控制
+/* 增量式 PID 控制
  *
- * 与原版相比：
- * 1. 使用“校准后的实际输出电压”做闭环比较
- * 2. 死区由 ±40mV 缩小到 ±20mV
- * 这样更容易把最终误差压到 0.05V 以内
+ * 说明：
+ * 1. 只跟随“已确认目标值 g_TargetVoltage_mV”
+ * 2. 用户修改 g_SetVoltage_mV 时，DAC 不会立即动作
+ * 3. 只有按下确认键后，才把设定值提交给闭环控制
+ * 4. 控制输出不是直接给一个绝对 DAC 值，而是每个周期修正一个 DAC 增量
  */
 static void Control_Update(void)
 {
-	int32_t Error;
-	int16_t Step = 0;
+	int32_t Error_mV;
+	float Error_V;
+	float DeltaU;
+	int32_t DeltaCode;
 	int32_t NewCode;
 
 	if (g_ProtectFlag)
@@ -236,56 +260,58 @@ static void Control_Update(void)
 		return;
 	}
 
-	/* 误差 = 目标值 - 实际值（这里的实际值已经校准过） */
-	Error = (int32_t)g_TargetVoltage_mV - (int32_t)g_OutputVoltage_mV;
+	/* 设定目标为 0V 时，直接关断输出并清空 PID 状态 */
+	if (g_TargetVoltage_mV == 0U)
+	{
+		PID_Reset();
+		if (g_DacCode != 0U)
+		{
+			Output_Shutdown();
+		}
+		return;
+	}
 
-	if (Error > 1200)
+	Error_mV = (int32_t)g_TargetVoltage_mV - (int32_t)g_OutputVoltage_mV;
+
+	/* 小误差区不动作，减小抖动 */
+	if ((Error_mV >= -PID_DEADBAND_MV) && (Error_mV <= PID_DEADBAND_MV))
 	{
-		Step = 24;
+		g_PidErr_2 = g_PidErr_1;
+		g_PidErr_1 = (float)Error_mV / 1000.0f;
+		return;
 	}
-	else if (Error > 500)
+
+	Error_V = (float)Error_mV / 1000.0f;
+
+	/* 增量式 PID */
+	DeltaU = PID_KP * (Error_V - g_PidErr_1)
+	       + PID_KI * Error_V * CONTROL_PERIOD_S
+	       + PID_KD * (Error_V - 2.0f * g_PidErr_1 + g_PidErr_2) / CONTROL_PERIOD_S;
+
+	/* 把控制增量映射成 DAC 码值增量 */
+	DeltaCode = (int32_t)(DeltaU * PID_OUTPUT_TO_DAC_CODE);
+
+	/* 四舍五入，避免小数截断偏差 */
+	if ((DeltaU * PID_OUTPUT_TO_DAC_CODE) >= 0.0f)
 	{
-		Step = 10;
-	}
-	else if (Error > 150)
-	{
-		Step = 4;
-	}
-	else if (Error > 60)
-	{
-		Step = 2;
-	}
-	else if (Error > 40)
-	{
-		Step = 1;
-	}
-	else if (Error < -1200)
-	{
-		Step = -24;
-	}
-	else if (Error < -500)
-	{
-		Step = -10;
-	}
-	else if (Error < -150)
-	{
-		Step = -4;
-	}
-	else if (Error < -60)
-	{
-		Step = -2;
-	}
-	else if (Error < -40)
-	{
-		Step = -1;
+		DeltaCode = (int32_t)(DeltaU * PID_OUTPUT_TO_DAC_CODE + 0.5f);
 	}
 	else
 	{
-		/* 误差在 ±20mV 以内时不再调节 */
-		Step = 0;
+		DeltaCode = (int32_t)(DeltaU * PID_OUTPUT_TO_DAC_CODE - 0.5f);
 	}
 
-	NewCode = (int32_t)g_DacCode + Step;
+	/* 限制单周期最大调整量 */
+	if (DeltaCode > PID_MAX_DELTA_CODE)
+	{
+		DeltaCode = PID_MAX_DELTA_CODE;
+	}
+	else if (DeltaCode < -PID_MAX_DELTA_CODE)
+	{
+		DeltaCode = -PID_MAX_DELTA_CODE;
+	}
+
+	NewCode = (int32_t)g_DacCode + DeltaCode;
 
 	if (NewCode < 0)
 	{
@@ -297,6 +323,10 @@ static void Control_Update(void)
 	}
 
 	DAC_Output((uint16_t)NewCode);
+
+	/* 更新误差历史 */
+	g_PidErr_2 = g_PidErr_1;
+	g_PidErr_1 = Error_V;
 }
 
 /* ============================================================
@@ -312,38 +342,24 @@ static void Key_Process(void)
 
 	if (KeyNum == 1)
 	{
-		if (g_ProtectFlag)
+		if (g_SetVoltage_mV + g_StepVoltage_mV <= TARGET_MAX_MV)
 		{
-			g_ProtectFlag = 0;
-			g_TargetVoltage_mV = 0;
-			Output_Shutdown();
-		}
-
-		if (g_TargetVoltage_mV + g_StepVoltage_mV <= TARGET_MAX_MV)
-		{
-			g_TargetVoltage_mV += g_StepVoltage_mV;
+			g_SetVoltage_mV += g_StepVoltage_mV;
 		}
 		else
 		{
-			g_TargetVoltage_mV = TARGET_MAX_MV;
+			g_SetVoltage_mV = TARGET_MAX_MV;
 		}
 	}
 	else if (KeyNum == 2)
 	{
-		if (g_ProtectFlag)
+		if (g_SetVoltage_mV >= g_StepVoltage_mV)
 		{
-			g_ProtectFlag = 0;
-			g_TargetVoltage_mV = 0;
-			Output_Shutdown();
-		}
-
-		if (g_TargetVoltage_mV >= g_StepVoltage_mV)
-		{
-			g_TargetVoltage_mV -= g_StepVoltage_mV;
+			g_SetVoltage_mV -= g_StepVoltage_mV;
 		}
 		else
 		{
-			g_TargetVoltage_mV = TARGET_MIN_MV;
+			g_SetVoltage_mV = TARGET_MIN_MV;
 		}
 	}
 	else if (KeyNum == 3)
@@ -356,6 +372,19 @@ static void Key_Process(void)
 		{
 			g_StepVoltage_mV = STEP_SMALL_MV;
 		}
+	}
+	else if (KeyNum == 4)
+	{
+		/* 确认键：清除保护并提交当前设定值 */
+		if (g_ProtectFlag)
+		{
+			g_ProtectFlag = 0;
+			g_ProtectType = 0;
+			Output_Shutdown();
+		}
+
+		g_TargetVoltage_mV = g_SetVoltage_mV;
+		PID_Reset();
 	}
 }
 
@@ -377,31 +406,45 @@ static void OLED_ShowFixedVoltage(uint8_t Line, const char *Title, uint32_t mV)
 	OLED_ShowString(Line, 1, Buf);
 }
 
-/* 显示内容：
-   第1行：设定电压
-   第2行：实际输出电压（校准后）
-   第3行：当前步进值
-   第4行：当前DAC设定值
-*/
 static void Display_Update(void)
 {
 	char Buf[17];
 
-	OLED_ShowFixedVoltage(1, "SET", g_TargetVoltage_mV);
+	OLED_ShowFixedVoltage(1, "SET", g_SetVoltage_mV);
 	OLED_ShowFixedVoltage(2, "OUT", g_OutputVoltage_mV);
 
 	if (g_StepVoltage_mV == STEP_SMALL_MV)
 	{
-		sprintf(Buf, "STEP:0.1V      ");
+		sprintf(Buf, "STEP:0.1V %c   ", (g_SetVoltage_mV == g_TargetVoltage_mV) ? ' ' : '*');
 	}
 	else
 	{
-		sprintf(Buf, "STEP:1.0V      ");
+		sprintf(Buf, "STEP:1.0V %c   ", (g_SetVoltage_mV == g_TargetVoltage_mV) ? ' ' : '*');
 	}
 	OLED_ShowString(3, 1, Buf);
 
-	sprintf(Buf, "DAC:%4u        ", g_DacCode);
-	OLED_ShowString(4, 1, Buf);
+	if (g_ProtectFlag)
+{
+	if (g_ProtectType == 1)
+	{
+		sprintf(Buf, "PROTECT:OCP   ");
+	}
+	else if (g_ProtectType == 2)
+	{
+		sprintf(Buf, "PROTECT:OVP   ");
+	}
+	else
+	{
+		sprintf(Buf, "PROTECT       ");
+	}
+}
+	else
+	{
+		sprintf(Buf, "DAC:%4u A:%2lu.%02lu", g_DacCode,
+				g_TargetVoltage_mV / 1000U,
+				(g_TargetVoltage_mV % 1000U) / 10U);
+	}
+OLED_ShowString(4, 1, Buf);
 }
 
 /* ============================================================
@@ -418,12 +461,14 @@ int main(void)
 	Key_Init();
 	MCP4725_Init();
 
+	g_SetVoltage_mV = 0;
 	g_TargetVoltage_mV = 0;
 	g_OutputVoltage_mV = 0;
 	g_OutputCurrent_mA = 0;
 	g_DacCode = 0;
 	g_ProtectFlag = 0;
 	g_StepVoltage_mV = STEP_SMALL_MV;
+	PID_Reset();
 
 	DAC_Output(0);
 
